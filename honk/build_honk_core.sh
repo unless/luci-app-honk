@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Build honk-core for an OpenWrt arch/target triple.
-#
-#   ./honk/build_honk_core.sh [--if-needed] <arch|target_triple> [output_file] [source_dir]
-#
-# --if-needed: skip when the output exists and its .stamp matches the target
-# (or has no stamp, i.e. a prebuilt artifact); rebuild on a target mismatch.
+# sy 分支专用 build_honk_core.sh
+# 与原版接口完全一致：./build_honk_core.sh [--if-needed] <arch|target_triple> [output_file] [source_dir]
+# 区别：不再本地编译 Rust/Zig，而是按当前 PKG_VERSION 从上游 release 的 ipk 中提取 honk-core。
 set -euo pipefail
 
 IF_NEEDED=0
@@ -17,148 +14,93 @@ done
 
 TARGET_IN="${1:?usage: $0 [--if-needed] <arch|target_triple> [output_file] [source_dir]}"
 OUT_FILE="${2:-}"
-SRC_DIR="${3:-}"
-
+SRC_DIR="${3:-}"   # 兼容原接口，取 bin 模式下忽略
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -f "${HOME:-}/.cargo/env" ]; then
-  . "${HOME:-}/.cargo/env"
-fi
-export PATH="${HOME:-}/.cargo/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
-
 case "$TARGET_IN" in
-  x86_64|x86_64-unknown-linux-musl)
-    RUST_TARGET=x86_64-unknown-linux-musl
-    ZIG_TARGET=x86_64-linux-musl
-    ;;
-  aarch64|aarch64_generic|aarch64-unknown-linux-musl)
-    RUST_TARGET=aarch64-unknown-linux-musl
-    ZIG_TARGET=aarch64-linux-musl
-    ;;
-  *)
-    echo "ERROR: unsupported arch: $TARGET_IN" >&2
-    exit 1
-    ;;
+  x86_64|x86_64-unknown-linux-musl) ARCH=x86_64; EXPECT=x86-64 ;;
+  aarch64|aarch64_generic|aarch64-unknown-linux-musl) ARCH=aarch64_generic; EXPECT=aarch64 ;;
+  *) echo "ERROR: unsupported arch: $TARGET_IN" >&2; exit 1 ;;
 esac
 
 OUT_FILE="${OUT_FILE:-$SCRIPT_DIR/files/honk-core.bin}"
-case "$OUT_FILE" in
-  /*) ;;
-  *) OUT_FILE="$PWD/$OUT_FILE" ;;
-esac
+case "$OUT_FILE" in /*) ;; *) OUT_FILE="$PWD/$OUT_FILE" ;; esac
 
-if [ "$IF_NEEDED" = 1 ] && [ -f "$OUT_FILE" ]; then
-  if [ ! -f "$OUT_FILE.stamp" ]; then
-    echo "==> using prebuilt honk-core (no stamp): $OUT_FILE"
-    exit 0
-  fi
-  if [ "$(cat "$OUT_FILE.stamp")" = "$RUST_TARGET" ]; then
-    echo "==> honk-core is up to date: $OUT_FILE"
-    exit 0
-  fi
-  echo "==> honk-core target changed, rebuilding: $OUT_FILE"
+# 与原版一致：已有 bin 且无 stamp，视为预编译产物，直接跳过
+if [ "$IF_NEEDED" = 1 ] && [ -f "$OUT_FILE" ] && [ ! -f "$OUT_FILE.stamp" ]; then
+  echo "==> using prebuilt honk-core: $OUT_FILE"
+  exit 0
 fi
-
-# Building: drop the old artifact so a failed build cannot be reused.
-rm -f "$OUT_FILE" "$OUT_FILE.stamp"
 
 MAKEFILE="${HONK_MAKEFILE:-$SCRIPT_DIR/Makefile}"
-if [ -n "$SRC_DIR" ]; then
-  eval "$("$SCRIPT_DIR/honk_toolchain.sh" --src "$SRC_DIR" "$MAKEFILE")"
+[ -f "$MAKEFILE" ] || { echo "ERROR: 找不到 $MAKEFILE" >&2; exit 1; }
+PKG_VERSION="$(sed -n 's/^PKG_VERSION:=//p' "$MAKEFILE" | head -n1)"
+PKG_RELEASE="$(sed -n 's/^PKG_RELEASE:=//p' "$MAKEFILE" | head -n1)"
+PKG_VERSION="${PKG_VERSION:-}"; PKG_RELEASE="${PKG_RELEASE:-1}"
+[ -n "$PKG_VERSION" ] || { echo "ERROR: 读不到 PKG_VERSION" >&2; exit 1; }
+
+RELEASE_REPO="${HONK_RELEASE_REPO:-QiuSimons/luci-app-honk}"
+VER_DOT="${PKG_VERSION//\~/.}"      # 2026.11.15.a9925bd
+VER_TAG="${PKG_VERSION//\~/_}"      # 2026.11.15_a9925bd
+TAG="honk_${VER_TAG}-r${PKG_RELEASE}"
+
+PAGE="https://github.com/${RELEASE_REPO}/releases/expanded_assets/$TAG"
+echo "==> release: $TAG / arch: $ARCH"
+ASSET_PATH="$(curl -fsSL "$PAGE" \
+  | grep -o 'href="[^"]*\.ipk"' | cut -d'"' -f2 \
+  | grep -F "/honk_${VER_DOT}-r${PKG_RELEASE}_${ARCH}-openwrt-" || true)"
+OW_VER="${HONK_OPENWRT_VER:-}"
+if [ -n "$OW_VER" ]; then
+  ASSET_PATH="$(printf '%s\n' "$ASSET_PATH" | grep -F -- "-openwrt-${OW_VER}.ipk" || true)"
+fi
+ASSET_PATH="$(printf '%s\n' "$ASSET_PATH" | head -n1)"
+[ -n "$ASSET_PATH" ] || {
+  echo "ERROR: 找不到 $TAG / $ARCH 的 ipk。可能该版本 release 尚未发布。" >&2
+  echo "       https://github.com/${RELEASE_REPO}/releases" >&2
+  exit 1
+}
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/honk-ipk"
+mkdir -p "$CACHE_DIR"
+IPK="$CACHE_DIR/$(basename "$ASSET_PATH")"
+if [ ! -s "$IPK" ]; then
+  echo "==> 下载 $(basename "$ASSET_PATH")"
+  curl -fL --retry 3 --retry-delay 2 -o "$IPK.part" "https://github.com${ASSET_PATH}"
+  mv "$IPK.part" "$IPK"
+fi
+
+TMP_DIR="$(mktemp -d)"; trap 'rm -rf "$TMP_DIR"' EXIT
+if tar -tf "$IPK" >/dev/null 2>&1; then
+  DATA_MEMBER="$(tar -tf "$IPK" | grep -E '(^|/)data\.tar\.' | head -n1)"
+  BIN_MEMBER="$(tar -xOf "$IPK" "$DATA_MEMBER" | tar -tzf - | grep -E '(^|/)usr/bin/honk-core$' | head -n1)"
 else
-  eval "$("$SCRIPT_DIR/honk_toolchain.sh" "$MAKEFILE")"
-  SRC_DIR="$SCRIPT_DIR/honk-src"
-  CACHED_REV=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || true)
-  if [ -d "$SRC_DIR/crates/honk-core" ] && [ "$CACHED_REV" = "$HONK_SRC_VERSION" ]; then
-    echo "==> Reusing $SRC_DIR at ${HONK_SRC_VERSION}"
-  else
-    if [ -n "$CACHED_REV" ]; then
-      echo "==> honk-src is at ${CACHED_REV}, expected ${HONK_SRC_VERSION}; refetching..."
-    fi
-    rm -rf "$SRC_DIR"
-    echo "==> Fetching honk source (${HONK_SRC_URL} @ ${HONK_SRC_VERSION})..."
-    git init -q "$SRC_DIR"
-    git -C "$SRC_DIR" remote add origin "$HONK_SRC_URL"
-    git -C "$SRC_DIR" fetch --depth 1 origin "$HONK_SRC_VERSION"
-    git -C "$SRC_DIR" checkout -q --detach FETCH_HEAD
-  fi
+  (cd "$TMP_DIR" && ar x "$IPK")
+  DATA_MEMBER="$(ls "$TMP_DIR"/data.tar.* | head -n1)"
+  BIN_MEMBER="$(tar -tf "$DATA_MEMBER" | grep -E '(^|/)usr/bin/honk-core$' | head -n1)"
 fi
-
-SRC_DIR="$(cd "$SRC_DIR" && pwd)"
-echo "==> Source: $SRC_DIR"
-echo "==> Target: $RUST_TARGET (zig: $ZIG_TARGET)"
-
-command -v zig >/dev/null 2>&1 || { echo "ERROR: zig not found in PATH" >&2; exit 1; }
-command -v bpf-linker >/dev/null 2>&1 || { echo "ERROR: bpf-linker not found in PATH" >&2; exit 1; }
-command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found in PATH" >&2; exit 1; }
-
-ZIG_ACTUAL="$(zig version)"
-if [ "$ZIG_ACTUAL" != "$ZIG_VERSION" ]; then
-  echo "ERROR: zig ${ZIG_ACTUAL} does not match the honk pin ${ZIG_VERSION}" >&2
-  exit 1
-fi
-echo "==> zig ${ZIG_ACTUAL}"
-
-# bpf-linker 0.11.0 reports 0.0.0; its tarball is checked by sha256 at install time.
-echo "==> $(bpf-linker --version 2>/dev/null | head -n 1)"
-
-cd "$SRC_DIR"
-EBPF_CHANNEL=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' crates/honk-ebpf/rust-toolchain.toml 2>/dev/null | head -n 1)
-EBPF_CHANNEL="${EBPF_CHANNEL:-nightly}"
-
-if command -v rustup >/dev/null 2>&1; then
-  rustup target add "$RUST_TARGET"
-  rustup toolchain install "$EBPF_CHANNEL" --component rust-src,llvm-tools
-fi
-
-echo "==> Building honk-ebpf object..."
-(
-  cd crates/honk-ebpf
-  cargo "+${EBPF_CHANNEL}" build --release -Zbuild-std=core --target bpfel-unknown-none
-)
-
-EBPF_OBJ="crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf"
-[ -f "$EBPF_OBJ" ] || { echo "ERROR: eBPF object not found at $EBPF_OBJ" >&2; exit 1; }
-if command -v readelf >/dev/null 2>&1; then
-  readelf -S "$EBPF_OBJ" | grep -q '\.BTF' || { echo "ERROR: $EBPF_OBJ has no .BTF section" >&2; exit 1; }
-fi
-
-export ZIGCC_TARGET="$ZIG_TARGET"
-L=$(printf '%s' "$RUST_TARGET" | tr '-' '_')
-U=$(printf '%s' "$RUST_TARGET" | tr 'a-z-' 'A-Z_')
-export "CC_${L}=$SRC_DIR/ci/zigcc"
-export "CXX_${L}=$SRC_DIR/ci/zigcxx"
-export "CARGO_TARGET_${U}_LINKER=$SRC_DIR/ci/zigcc"
-if [[ "$RUST_TARGET" == *-musl ]]; then
-  export "CARGO_TARGET_${U}_RUSTFLAGS=-C link-self-contained=no"
-fi
-export BINDGEN_EXTRA_CLANG_ARGS="$("$SRC_DIR/ci/zig-bindgen-env" "$ZIGCC_TARGET")"
-
-echo "==> Building honk-core for $RUST_TARGET..."
-cargo build --release --locked \
-  -p honk-core \
-  --no-default-features \
-  --features ebpf,rprx,clash-api,native-api,jemalloc \
-  --target "$RUST_TARGET"
-
-BUILT_BIN="$SRC_DIR/target/$RUST_TARGET/release/honk-core"
-[ -f "$BUILT_BIN" ] || { echo "ERROR: expected output not found at $BUILT_BIN" >&2; exit 1; }
-
-FILE_DESC=$(file -b "$BUILT_BIN")
-case "$FILE_DESC" in
-  ELF*) ;;
-  *) echo "ERROR: output is not an ELF binary: $FILE_DESC" >&2; exit 1 ;;
-esac
-if [[ "$RUST_TARGET" == *-musl ]] && [[ "$FILE_DESC" != *"statically linked"* ]]; then
-  echo "ERROR: $RUST_TARGET binary is not statically linked: $FILE_DESC" >&2
-  exit 1
-fi
+[ -n "${BIN_MEMBER:-}" ] || { echo "ERROR: ipk 里找不到 usr/bin/honk-core" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT_FILE")"
-cp -f "$BUILT_BIN" "$OUT_FILE"
+tar -xOf "$IPK" "$DATA_MEMBER" | tar -xzOf - "$BIN_MEMBER" > "$OUT_FILE" \
+  2>/dev/null || tar -xOf "$DATA_MEMBER" "$BIN_MEMBER" > "$OUT_FILE"
 chmod +x "$OUT_FILE"
-printf '%s\n' "$RUST_TARGET" > "$OUT_FILE.stamp"
+# 不生成 .stamp，这样后续 --if-needed 会持续走预编译分支
+rm -f "$OUT_FILE.stamp" 2>/dev/null || true
 
-echo "==> Build succeeded: $OUT_FILE"
+FILE_DESC="$(file -b "$OUT_FILE")"
+case "$FILE_DESC" in
+  ELF*) ;;
+  *) echo "ERROR: 产物不是 ELF: $FILE_DESC" >&2; exit 1 ;;
+esac
+case "$FILE_DESC" in
+  *"$EXPECT"*) ;;
+  *) echo "ERROR: 产物架构不匹配（期望 $EXPECT）: $FILE_DESC" >&2; exit 1 ;;
+esac
+case "$FILE_DESC" in
+  *"statically linked"*) ;;
+  *) echo "ERROR: 产物不是静态链接: $FILE_DESC" >&2; exit 1 ;;
+esac
+
+echo "==> 完成: $OUT_FILE"
 echo "==> $FILE_DESC"
 ls -lh "$OUT_FILE"

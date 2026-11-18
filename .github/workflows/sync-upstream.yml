@@ -1,0 +1,70 @@
+# 把上游 QiuSimons/luci-app-honk 同步到本仓库 master，
+# 唯一例外：honk/build_honk_core.sh 保留本仓库的定制版（从 release ipk 取 bin）。
+name: Sync upstream QiuSimons
+
+on:
+  schedule:
+    - cron: '0 3 * * *'          # 每天 03:00 UTC（避开上游 update-honk 的 00:17）
+  workflow_dispatch:             # 允许手动触发
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/QiuSimons/luci-app-honk.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/QiuSimons/luci-app-honk.git
+          git fetch upstream master
+
+      - name: Merge upstream, keep our build_honk_core.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUSTOM="honk/build_honk_core.sh"
+          # 先把定制脚本存到仓库外，merge 后无条件恢复，杜绝被上游覆盖
+          cp "$CUSTOM" "$RUNNER_TEMP/custom-build_honk_core.sh"
+
+          # 其余文件跟随上游；内容冲突一律取上游版本
+          if ! git merge upstream/master -m "sync upstream QiuSimons" -X theirs; then
+            echo "残留冲突，逐个用 theirs 解决："
+            git diff --name-only --diff-filter=U | while IFS= read -r f; do
+              git checkout --theirs -- "$f" 2>/dev/null || git rm -f -- "$f"
+              git add -A -- "$f"
+            done
+            git commit --no-edit
+          fi
+
+          # 恢复定制脚本（无论 merge 怎么处理过它）
+          cp "$RUNNER_TEMP/custom-build_honk_core.sh" "$CUSTOM"
+          git add "$CUSTOM"
+          if ! git diff --cached --quiet; then
+            git commit -m "sync: keep local build_honk_core.sh customization"
+          fi
+
+          # 硬校验：定制脚本必须是取 bin 版，否则中止，不推送
+          grep -q 'QiuSimons/luci-app-honk' "$CUSTOM" || {
+            echo "::error::build_honk_core.sh 不是定制版，拒绝推送"
+            exit 1
+          }
+          echo "OK: 定制脚本已保留，其余已同步到上游"
+
+      - name: Push master
+        run: git push origin master
